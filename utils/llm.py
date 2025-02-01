@@ -21,6 +21,13 @@ class LLMClient:
         3. 日期函数使用SQLite的date/datetime函数
         4. 字符串连接使用 || 而不是 CONCAT
         5. 使用标准的SQL聚合函数(COUNT, SUM, AVG, MAX, MIN)
+        6. 请按照以下格式编写SQL:
+           - SELECT/INSERT/UPDATE/DELETE 单独一行
+           - FROM 子句单独一行
+           - WHERE/GROUP BY/HAVING/ORDER BY 各自单独一行
+           - JOIN 子句每个单独一行
+           - 使用适当的缩进
+           - 子查询使用合适的换行和缩进
         
         目前的数据库表结构如下：
         
@@ -74,7 +81,7 @@ class LLMClient:
             f"{self.base_url}/api/generate",
             json={
                 "model": self.model,
-                "prompt": f"{system_prompt}\n\n用户查询：{prompt}\n\nSQLite SQL语句：",
+                "prompt": f"{system_prompt}\n\n用户查询：{prompt}\n\nSQLite SQL语句：\n",  # 添加换行
                 "stream": True
             },
             stream=True
@@ -130,6 +137,39 @@ class LLMClient:
             elif not cleaned_response.endswith(';'):
                 cleaned_response += ';'
             
+            # 在返回之前格式化SQL
+            def format_sql(sql):
+                # 移除多余的空格和换行
+                sql = ' '.join(sql.split())
+                
+                # 添加适当的换行和缩进
+                keywords = ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN']
+                formatted = []
+                lines = sql.split(';')[0].strip().split(' ')
+                current_line = []
+                
+                for word in lines:
+                    if word.upper() in keywords:
+                        if current_line:
+                            formatted.append(' '.join(current_line))
+                            current_line = []
+                        if word.upper().endswith('JOIN'):
+                            formatted.append('    ' + word)  # 添加缩进
+                        else:
+                            formatted.append(word)
+                    else:
+                        current_line.append(word)
+                
+                if current_line:
+                    if formatted and formatted[-1] in keywords:
+                        formatted.append('    ' + ' '.join(current_line))  # 添加缩进
+                    else:
+                        formatted.append(' '.join(current_line))
+                
+                return '\n'.join(formatted) + ';'
+            
+            # 格式化SQL并返回
+            cleaned_response = format_sql(cleaned_response)
             return cleaned_response
         else:
             return f"Error: {response.status_code}"
