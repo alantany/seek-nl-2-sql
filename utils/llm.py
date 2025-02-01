@@ -1,6 +1,8 @@
 import requests
 import json
 from openai import OpenAI
+import pandas as pd
+import time
 
 class LLMClient:
     def __init__(self, base_url, model, openai_key=None, openai_base_url=None, openai_model=None):
@@ -11,7 +13,7 @@ class LLMClient:
         self.openai_base_url = openai_base_url
         self.openai_model = openai_model
     
-    def generate_sql(self, prompt):
+    def generate_sql(self, prompt, db=None):
         """调用LLM生成SQL查询"""
         system_prompt = """你是一个SQLite数据库专家，请将用户的自然语言转换为SQLite SQL查询语句。
         
@@ -59,120 +61,208 @@ class LLMClient:
         
         请只返回SQL语句，不需要其他解释。确保SQL语句符合SQLite语法规范。"""
         
-        # 获取两个模型的结果
         results = {}
         
-        # DeepSeek模型
+        # 先执行ChatGPT
         try:
-            deepseek_response = self._generate_sql_deepseek(system_prompt, prompt)
-            results['deepseek'] = deepseek_response
+            start_time = time.time()
+            chatgpt_response = self._generate_sql_chatgpt(system_prompt, prompt)
+            chatgpt_time = time.time() - start_time
+            results['chatgpt'] = {
+                'sql': chatgpt_response,
+                'time': chatgpt_time
+            }
         except Exception as e:
-            results['deepseek'] = f"Error: {str(e)}"
+            results['chatgpt'] = {
+                'sql': f"Error: {str(e)}",
+                'time': 0
+            }
         
-        # ChatGPT模型
-        chatgpt_response = self._generate_sql_chatgpt(system_prompt, prompt)
-        results['chatgpt'] = chatgpt_response
+        # 不再重复执行DeepSeek
+        results['deepseek'] = None
         
         return results
     
-    def _generate_sql_deepseek(self, system_prompt, prompt):
-        """使用DeepSeek模型生成SQL"""
-        response = requests.post(
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": f"{system_prompt}\n\n用户查询：{prompt}\n\nSQLite SQL语句：\n",  # 添加换行
-                "stream": True
-            },
-            stream=True
-        )
+    def _generate_sql_deepseek(self, system_prompt, prompt, db, log_callback=None):
+        """使用DeepSeek模型生成SQL，并自动修正错误"""
+        def log(message):
+            if log_callback:
+                log_callback(message)
+            print(message)
         
-        if response.status_code == 200:
-            full_response = ""
-            thinking_mode = False
+        max_attempts = 3
+        attempt = 1
+        attempt_history = []
+        start_time = time.time()
+        
+        while attempt <= max_attempts:
+            if attempt > 1:
+                log(f"\n=== 第{attempt}次尝试生成SQL ===")
+            else:
+                log("\n=== 开始生成SQL ===")
             
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        json_response = json.loads(line)
-                        if 'response' in json_response:
-                            content = json_response['response']
-                            
-                            # 处理特殊标记
-                            if content == '<think>':
-                                thinking_mode = True
-                                continue
-                            elif content == '</think>':
-                                thinking_mode = False
-                                continue
-                            elif content == '\n\n':
-                                continue
-                            
-                            # 如果不在思考模式，添加内容
-                            if not thinking_mode:
-                                full_response += content
+            log(f"[{time.strftime('%H:%M:%S')}] 正在从DeepSeek获取响应...")
+            
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": f"{system_prompt}\n\n用户查询：{prompt}\n\n" + 
+                             (f"前一次生成的SQL有错误，请修正：{error_msg}\n\n" if 'error_msg' in locals() else "") +
+                             "SQLite SQL语句：\n",
+                    "stream": True
+                },
+                stream=True
+            )
+            
+            if response.status_code == 200:
+                full_response = ""
+                thinking_mode = False
+                
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            json_response = json.loads(line)
+                            if 'response' in json_response:
+                                content = json_response['response']
                                 
-                    except json.JSONDecodeError:
-                        continue
-            
-            # 清理响应文本
-            cleaned_response = full_response.strip()
-            # 移除解释性文本，只保留SQL语句
-            if 'SELECT' in cleaned_response.upper():
-                cleaned_response = cleaned_response[cleaned_response.upper().find('SELECT'):]
-            elif 'INSERT' in cleaned_response.upper():
-                cleaned_response = cleaned_response[cleaned_response.upper().find('INSERT'):]
-            elif 'UPDATE' in cleaned_response.upper():
-                cleaned_response = cleaned_response[cleaned_response.upper().find('UPDATE'):]
-            elif 'DELETE' in cleaned_response.upper():
-                cleaned_response = cleaned_response[cleaned_response.upper().find('DELETE'):]
+                                # 处理特殊标记
+                                if content == '<think>':
+                                    thinking_mode = True
+                                    continue
+                                elif content == '</think>':
+                                    thinking_mode = False
+                                    continue
+                                elif content == '\n\n':
+                                    continue
+                                
+                                # 如果不在思考模式，添加内容
+                                if not thinking_mode:
+                                    full_response += content
+                                    
+                        except json.JSONDecodeError:
+                            continue
                 
-            # 清理SQL语句
-            cleaned_response = cleaned_response.strip()
-            # 去掉末尾的引号
-            cleaned_response = cleaned_response.rstrip('"').rstrip("'")
-            # 确保以分号结尾，并去掉分号后的内容
-            if ';' in cleaned_response:
-                cleaned_response = cleaned_response.split(';')[0] + ';'
-            elif not cleaned_response.endswith(';'):
-                cleaned_response += ';'
-            
-            # 在返回之前格式化SQL
-            def format_sql(sql):
-                # 移除多余的空格和换行
-                sql = ' '.join(sql.split())
+                # 清理响应文本
+                cleaned_response = full_response.strip()
+                # 移除解释性文本，只保留SQL语句
+                if 'SELECT' in cleaned_response.upper():
+                    cleaned_response = cleaned_response[cleaned_response.upper().find('SELECT'):]
+                elif 'INSERT' in cleaned_response.upper():
+                    cleaned_response = cleaned_response[cleaned_response.upper().find('INSERT'):]
+                elif 'UPDATE' in cleaned_response.upper():
+                    cleaned_response = cleaned_response[cleaned_response.upper().find('UPDATE'):]
+                elif 'DELETE' in cleaned_response.upper():
+                    cleaned_response = cleaned_response[cleaned_response.upper().find('DELETE'):]
+                    
+                # 清理SQL语句
+                cleaned_response = cleaned_response.strip()
+                # 去掉末尾的引号
+                cleaned_response = cleaned_response.rstrip('"').rstrip("'")
+                # 确保以分号结尾，并去掉分号后的内容
+                if ';' in cleaned_response:
+                    cleaned_response = cleaned_response.split(';')[0] + ';'
+                elif not cleaned_response.endswith(';'):
+                    cleaned_response += ';'
                 
-                # 添加适当的换行和缩进
-                keywords = ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN']
-                formatted = []
-                lines = sql.split(';')[0].strip().split(' ')
-                current_line = []
-                
-                for word in lines:
-                    if word.upper() in keywords:
-                        if current_line:
-                            formatted.append(' '.join(current_line))
-                            current_line = []
-                        if word.upper().endswith('JOIN'):
-                            formatted.append('    ' + word)  # 添加缩进
+                # 在返回之前格式化SQL
+                def format_sql(sql):
+                    # 移除多余的空格和换行
+                    sql = ' '.join(sql.split())
+                    
+                    # 添加适当的换行和缩进
+                    keywords = ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN']
+                    formatted = []
+                    lines = sql.split(';')[0].strip().split(' ')
+                    current_line = []
+                    
+                    for word in lines:
+                        if word.upper() in keywords:
+                            if current_line:
+                                formatted.append(' '.join(current_line))
+                                current_line = []
+                            if word.upper().endswith('JOIN'):
+                                formatted.append('    ' + word)  # 添加缩进
+                            else:
+                                formatted.append(word)
                         else:
-                            formatted.append(word)
-                    else:
-                        current_line.append(word)
+                            current_line.append(word)
+                    
+                    if current_line:
+                        if formatted and formatted[-1] in keywords:
+                            formatted.append('    ' + ' '.join(current_line))  # 添加缩进
+                        else:
+                            formatted.append(' '.join(current_line))
+                    
+                    return '\n'.join(formatted) + ';'
                 
-                if current_line:
-                    if formatted and formatted[-1] in keywords:
-                        formatted.append('    ' + ' '.join(current_line))  # 添加缩进
-                    else:
-                        formatted.append(' '.join(current_line))
+                # 格式化SQL并返回
+                cleaned_response = format_sql(cleaned_response)
+                log(f"[{time.strftime('%H:%M:%S')}] 生成的SQL:\n{cleaned_response}\n")
                 
-                return '\n'.join(formatted) + ';'
-            
-            # 格式化SQL并返回
-            cleaned_response = format_sql(cleaned_response)
-            return cleaned_response
-        else:
-            return f"Error: {response.status_code}"
+                # 尝试执行SQL
+                try:
+                    log(f"[{time.strftime('%H:%M:%S')}] 正在验证SQL...")
+                    result = db.execute_query(cleaned_response)
+                    if isinstance(result, pd.DataFrame):
+                        log(f"[{time.strftime('%H:%M:%S')}] SQL验证成功！")
+                        execution_time = time.time() - start_time
+                        return {
+                            'sql': cleaned_response,
+                            'attempts': attempt,
+                            'success': True,
+                            'history': attempt_history,
+                            'time': execution_time
+                        }
+                    else:
+                        # 直接使用数据库返回的错误信息
+                        raise Exception(str(result))
+                except Exception as e:
+                    error_msg = str(e)
+                    log(f"[{time.strftime('%H:%M:%S')}] SQL执行失败: {error_msg}")
+                    
+                    attempt_history.append({
+                        'attempt': attempt,
+                        'sql': cleaned_response,
+                        'error': error_msg,
+                        'timestamp': time.strftime('%H:%M:%S')
+                    })
+                    
+                    if attempt == max_attempts:
+                        log(f"[{time.strftime('%H:%M:%S')}] 达到最大重试次数({max_attempts})，停止尝试")
+                        execution_time = time.time() - start_time
+                        return {
+                            'sql': cleaned_response,
+                            'attempts': attempt,
+                            'success': False,
+                            'error': error_msg,
+                            'history': attempt_history,
+                            'time': execution_time
+                        }
+                    
+                    log(f"[{time.strftime('%H:%M:%S')}] 准备进行第{attempt + 1}次尝试...")
+                    attempt += 1
+                    continue
+            else:
+                execution_time = time.time() - start_time
+                return {
+                    'sql': f"Error: {response.status_code}",
+                    'attempts': attempt,
+                    'success': False,
+                    'error': f"API错误: {response.status_code}",
+                    'history': [],
+                    'time': execution_time
+                }
+        
+        execution_time = time.time() - start_time
+        return {
+            'sql': "达到最大重试次数",
+            'attempts': max_attempts,
+            'success': False,
+            'error': "无法生成有效SQL",
+            'history': attempt_history,
+            'time': execution_time
+        }
     
     def _generate_sql_chatgpt(self, system_prompt, prompt):
         """使用ChatGPT模型生成SQL"""
@@ -196,6 +286,12 @@ class LLMClient:
             sql = response.choices[0].message.content.strip()
             
             # 清理SQL语句
+            # 移除开头的```sql和结尾的```
+            sql = sql.strip('`').strip()
+            if sql.lower().startswith('sql'):
+                sql = sql[3:].strip()
+            
+            # 提取SQL语句
             if 'SELECT' in sql.upper():
                 sql = sql[sql.upper().find('SELECT'):]
             elif 'INSERT' in sql.upper():
@@ -205,6 +301,7 @@ class LLMClient:
             elif 'DELETE' in sql.upper():
                 sql = sql[sql.upper().find('DELETE'):]
             
+            # 清理引号和分号
             sql = sql.strip().rstrip('"').rstrip("'")
             if ';' in sql:
                 sql = sql.split(';')[0] + ';'
